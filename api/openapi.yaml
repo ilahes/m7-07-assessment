@@ -1,0 +1,774 @@
+openapi: "3.1.0"
+
+info:
+  title: Recommendation Service API
+  version: "1.0.0"
+  description: >
+    Personalized product recommendation API for the RetailCo mobile app.
+    Serves Scenario X: 800 RPS peak, p95 ≤ 120 ms end-to-end.
+    Supports synchronous, batch, and asynchronous recommendation modes.
+  contact:
+    name: ML Platform Team
+    email: ml-platform@retailco.com
+
+servers:
+  - url: https://api.retailco.com/rec/v1
+    description: Production
+  - url: https://api-staging.retailco.com/rec/v1
+    description: Staging
+
+# ── Security ──────────────────────────────────────────────────────
+security:
+  - BearerAuth: []
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  # ── Reusable Headers ────────────────────────────────────────────
+  headers:
+    X-Request-ID:
+      description: >
+        Unique request identifier. Echo of the inbound X-Request-ID header,
+        or a server-generated UUID if not provided. Used for distributed tracing.
+      schema:
+        type: string
+        format: uuid
+      example: "550e8400-e29b-41d4-a716-446655440000"
+
+    X-Model-Version:
+      description: >
+        Model version that served this request. Format: v{MAJOR}.{MINOR}.{PATCH}-{YYYYMMDD}.
+        Used by monitoring to detect version mismatches (see monitoring/alerts.yaml:
+        RecModelVersionMismatch). Must match the registry entry for the current production
+        or canary model.
+      schema:
+        type: string
+        pattern: '^v\d+\.\d+\.\d+-\d{8}$'
+      example: "v1.3.0-20260601"
+
+    X-Experiment-ID:
+      description: >
+        A/B experiment assignment for this request, if applicable.
+        Format: {experiment_slug}:{variant}. Empty string if no experiment is active
+        for this user. Propagated to all downstream services and included in traces.
+      schema:
+        type: string
+      example: "exp-20260601-challenger:treatment"
+
+    X-Fallback:
+      description: >
+        Indicates that the response used a fallback recommendation strategy.
+        Value is the fallback type. Absent if the personalized path was used.
+      schema:
+        type: string
+        enum: [popularity, editorial, cached]
+      example: "popularity"
+
+  # ── Reusable Schemas ────────────────────────────────────────────
+  schemas:
+    RecommendationItem:
+      type: object
+      required: [item_id, score, rank]
+      properties:
+        item_id:
+          type: string
+          description: Product catalog item identifier.
+          example: "item_9876543"
+        score:
+          type: number
+          format: float
+          description: Model relevance score (higher = more relevant). Not calibrated as a probability.
+          example: 0.8423
+        rank:
+          type: integer
+          minimum: 1
+          description: Rank within the returned list (1 = most relevant).
+          example: 1
+        title:
+          type: string
+          description: Product display title (enriched from catalog cache).
+          example: "Running Shoes - Air Max Pro"
+        category:
+          type: string
+          example: "footwear/running"
+        price_usd:
+          type: number
+          format: float
+          example: 129.99
+        in_stock:
+          type: boolean
+          example: true
+        image_url:
+          type: string
+          format: uri
+          example: "https://cdn.retailco.com/products/9876543/main.jpg"
+
+    SyncRecommendationRequest:
+      type: object
+      required: [user_id, context]
+      properties:
+        user_id:
+          type: string
+          description: Opaque user identifier. Must be consistent across sessions.
+          example: "u_12345"
+        context:
+          type: string
+          enum: [home_screen, pdp_similar, cart_upsell, search_augment]
+          description: Placement context determines re-ranking weights.
+          example: "home_screen"
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 20
+          description: Maximum number of recommendations to return.
+          example: 20
+        exclude_item_ids:
+          type: array
+          items:
+            type: string
+          maxItems: 100
+          description: Item IDs to exclude from recommendations (e.g. recently purchased).
+          example: ["item_1111", "item_2222"]
+        session_signals:
+          type: object
+          description: Optional real-time session signals to augment feature vector.
+          properties:
+            viewed_item_ids:
+              type: array
+              items:
+                type: string
+              maxItems: 10
+              example: ["item_3333", "item_4444"]
+            cart_item_ids:
+              type: array
+              items:
+                type: string
+              maxItems: 50
+              example: ["item_5555"]
+
+    SyncRecommendationResponse:
+      type: object
+      required: [request_id, user_id, recommendations, model_version, latency_ms]
+      properties:
+        request_id:
+          type: string
+          format: uuid
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        user_id:
+          type: string
+          example: "u_12345"
+        recommendations:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecommendationItem'
+          minItems: 0
+          maxItems: 50
+        model_version:
+          type: string
+          description: Model version that served this request. Mirrors X-Model-Version header.
+          example: "v1.3.0-20260601"
+        experiment_id:
+          type: string
+          description: A/B experiment assignment, if active. Mirrors X-Experiment-ID header.
+          example: "exp-20260601-challenger:treatment"
+        fallback_used:
+          type: boolean
+          description: True if a fallback strategy was used (cold-start user or feature store miss).
+          example: false
+        latency_ms:
+          type: integer
+          description: Server-side processing time in milliseconds (excludes network).
+          example: 47
+
+    BatchRecommendationRequest:
+      type: object
+      required: [requests]
+      properties:
+        requests:
+          type: array
+          items:
+            $ref: '#/components/schemas/SyncRecommendationRequest'
+          minItems: 1
+          maxItems: 200
+          description: Up to 200 individual recommendation requests in a single call.
+
+    BatchRecommendationResponse:
+      type: object
+      required: [results, model_version]
+      properties:
+        results:
+          type: array
+          items:
+            type: object
+            required: [user_id, recommendations]
+            properties:
+              user_id:
+                type: string
+                example: "u_12345"
+              recommendations:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RecommendationItem'
+              fallback_used:
+                type: boolean
+                example: false
+              error:
+                type: string
+                description: Per-item error message if this user's recommendations could not be computed.
+                example: null
+        model_version:
+          type: string
+          example: "v1.3.0-20260601"
+        total_latency_ms:
+          type: integer
+          description: Server-side total wall-clock time for the batch.
+          example: 312
+
+    AsyncJobRequest:
+      type: object
+      required: [user_ids, context]
+      properties:
+        user_ids:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          maxItems: 10000
+          description: List of user IDs to generate recommendations for asynchronously.
+          example: ["u_10001", "u_10002", "u_10003"]
+        context:
+          type: string
+          enum: [home_screen, pdp_similar, cart_upsell, search_augment]
+          example: "home_screen"
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 20
+        callback_url:
+          type: string
+          format: uri
+          description: Optional webhook URL to POST results to when the job completes.
+          example: "https://internal.retailco.com/webhooks/rec-batch-done"
+        priority:
+          type: string
+          enum: [normal, low]
+          default: normal
+
+    AsyncJobResponse:
+      type: object
+      required: [job_id, status, created_at, estimated_completion_seconds]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+          example: "7f3a9b2c-1d4e-5f6a-8b7c-9d0e1f2a3b4c"
+        status:
+          type: string
+          enum: [queued, running, completed, failed]
+          example: "queued"
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-06-01T14:30:00Z"
+        estimated_completion_seconds:
+          type: integer
+          example: 45
+        result_url:
+          type: string
+          format: uri
+          description: Present only when status is 'completed'. Pre-signed GCS URL to download NDJSON results.
+          example: null
+
+    HealthResponse:
+      type: object
+      required: [status, version]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+          example: "ok"
+        version:
+          type: string
+          example: "v1.3.0-20260601"
+        uptime_seconds:
+          type: integer
+          example: 86400
+
+    ReadinessResponse:
+      type: object
+      required: [status, model_version, model_loaded]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+          example: "ready"
+        model_version:
+          type: string
+          example: "v1.3.0-20260601"
+        model_loaded:
+          type: boolean
+          example: true
+        feature_schema_version:
+          type: string
+          example: "v3"
+        redis_connected:
+          type: boolean
+          example: true
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id]
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code.
+              enum:
+                - invalid_request
+                - user_not_found
+                - rate_limit_exceeded
+                - model_not_loaded
+                - feature_store_unavailable
+                - internal_error
+                - job_not_found
+              example: "invalid_request"
+            message:
+              type: string
+              description: Human-readable error description.
+              example: "Field 'user_id' is required."
+            request_id:
+              type: string
+              format: uuid
+              example: "550e8400-e29b-41d4-a716-446655440000"
+            details:
+              type: object
+              description: Optional additional context (field-level validation errors, etc.)
+              additionalProperties: true
+
+  # ── Reusable Parameters ─────────────────────────────────────────
+  parameters:
+    RequestIDHeader:
+      name: X-Request-ID
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+      description: Client-provided request ID for tracing. Server generates one if absent.
+
+  # ── Reusable Responses ──────────────────────────────────────────
+  responses:
+    BadRequest:
+      description: Request validation failed.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/X-Request-ID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    RateLimited:
+      description: Per-user rate limit exceeded (50 req/min).
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds to wait before retrying.
+        X-Request-ID:
+          $ref: '#/components/headers/X-Request-ID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    InternalError:
+      description: Unexpected server error.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/X-Request-ID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+# ── Paths ──────────────────────────────────────────────────────────
+paths:
+
+  # ── Sync Recommendations ────────────────────────────────────────
+  /recommendations:
+    post:
+      operationId: getRecommendations
+      summary: Get personalized recommendations (synchronous)
+      description: >
+        Returns up to `limit` ranked product recommendations for a single user.
+        p95 latency SLO: ≤ 120 ms end-to-end at 800 RPS peak.
+        Cold-start users (no history) receive popularity-based fallback recommendations;
+        the response includes `fallback_used: true` and the `X-Fallback` response header.
+      tags: [Recommendations]
+      parameters:
+        - $ref: '#/components/parameters/RequestIDHeader'
+        - name: X-Experiment-ID
+          in: header
+          required: false
+          schema:
+            type: string
+          description: >
+            If provided by the client, overrides the server-side experiment assignment.
+            Used by the mobile app to pass a sticky assignment from a prior session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SyncRecommendationRequest'
+            examples:
+              returning_user:
+                summary: Returning user with history
+                externalValue: examples/sync-request.json
+              cold_start:
+                summary: New user (cold-start)
+                value:
+                  user_id: "u_cold_99999"
+                  context: "home_screen"
+                  limit: 20
+      responses:
+        "200":
+          description: Recommendations returned successfully.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+            X-Model-Version:
+              $ref: '#/components/headers/X-Model-Version'
+            X-Experiment-ID:
+              $ref: '#/components/headers/X-Experiment-ID'
+            X-Fallback:
+              $ref: '#/components/headers/X-Fallback'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncRecommendationResponse'
+              examples:
+                success:
+                  externalValue: examples/sync-response.json
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "429":
+          $ref: '#/components/responses/RateLimited'
+        "503":
+          description: Model not loaded or feature store unavailable.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+            Retry-After:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  # ── Batch Recommendations ───────────────────────────────────────
+  /recommendations:batch:
+    post:
+      operationId: getBatchRecommendations
+      summary: Get recommendations for multiple users (batch synchronous)
+      description: >
+        Returns recommendations for up to 200 users in a single request.
+        Requests are processed in parallel. Partial failures (individual user errors)
+        are included inline in the response rather than failing the entire batch.
+        p95 latency SLO: ≤ 500 ms for a 50-user batch.
+        Use the async endpoint (/recommendation-jobs) for batches larger than 200 users.
+      tags: [Recommendations]
+      parameters:
+        - $ref: '#/components/parameters/RequestIDHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchRecommendationRequest'
+            examples:
+              batch_50:
+                summary: 50-user batch
+                externalValue: examples/batch-request.json
+      responses:
+        "200":
+          description: Batch recommendations returned. Check per-item `error` field for partial failures.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+            X-Model-Version:
+              $ref: '#/components/headers/X-Model-Version'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchRecommendationResponse'
+              examples:
+                success:
+                  externalValue: examples/batch-response.json
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "429":
+          $ref: '#/components/responses/RateLimited'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  # ── Async Job Submit ────────────────────────────────────────────
+  /recommendation-jobs:
+    post:
+      operationId: createRecommendationJob
+      summary: Submit an async recommendation job for large user cohorts
+      description: >
+        Enqueues an asynchronous recommendation job for up to 10,000 users.
+        Returns a job_id immediately. Poll GET /recommendation-jobs/{job_id} for status.
+        Results are written to a pre-signed GCS URL (valid 24 hours) when complete.
+        Typical completion time: 30–90 seconds for 10,000 users.
+        Use case: nightly email campaign personalization, push notification targeting.
+      tags: [Async Jobs]
+      parameters:
+        - $ref: '#/components/parameters/RequestIDHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AsyncJobRequest'
+            examples:
+              large_cohort:
+                summary: 10,000 user async job
+                externalValue: examples/async-request.json
+      responses:
+        "202":
+          description: Job accepted and queued.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+            Location:
+              schema:
+                type: string
+                format: uri
+              description: URL to poll for job status.
+              example: "/v1/recommendation-jobs/7f3a9b2c-1d4e-5f6a-8b7c-9d0e1f2a3b4c"
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AsyncJobResponse'
+              examples:
+                accepted:
+                  externalValue: examples/async-response.json
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "429":
+          $ref: '#/components/responses/RateLimited'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  # ── Async Job Status ────────────────────────────────────────────
+  /recommendation-jobs/{job_id}:
+    get:
+      operationId: getRecommendationJob
+      summary: Poll async job status and retrieve result URL
+      tags: [Async Jobs]
+      parameters:
+        - $ref: '#/components/parameters/RequestIDHeader'
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "7f3a9b2c-1d4e-5f6a-8b7c-9d0e1f2a3b4c"
+      responses:
+        "200":
+          description: Job status returned. When `status` is `completed`, `result_url` is populated.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AsyncJobResponse'
+        "404":
+          description: Job ID not found or expired (jobs expire after 48 hours).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  # ── Liveness ────────────────────────────────────────────────────
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Liveness check
+      description: >
+        Returns 200 if the process is running. No dependency checks.
+        Used by Kubernetes livenessProbe.
+      tags: [Observability]
+      security: []
+      responses:
+        "200":
+          description: Service is alive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  # ── Readiness ───────────────────────────────────────────────────
+  /ready:
+    get:
+      operationId: readinessCheck
+      summary: Readiness check
+      description: >
+        Returns 200 only when the model is loaded, FAISS index is warm,
+        and Redis is reachable. Used by Kubernetes readinessProbe.
+        Returns 503 during startup (model download + load) or if dependencies are down.
+      tags: [Observability]
+      security: []
+      responses:
+        "200":
+          description: Service is ready to accept traffic.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessResponse'
+              example:
+                status: ready
+                model_version: "v1.3.0-20260601"
+                model_loaded: true
+                feature_schema_version: "v3"
+                redis_connected: true
+        "503":
+          description: Service is not ready (model loading or dependency unavailable).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessResponse'
+              example:
+                status: not_ready
+                model_version: "UNSET"
+                model_loaded: false
+                feature_schema_version: "v3"
+                redis_connected: true
+
+webhooks:
+  # ── Async Job Completion Callback ────────────────────────────────
+  # When a POST /recommendation-jobs request includes a `callback_url`,
+  # the service will POST this payload to that URL upon job completion or failure.
+  # The caller must return HTTP 2xx to acknowledge receipt; non-2xx triggers
+  # up to 3 retries with exponential backoff (5s, 25s, 125s).
+  recommendationJobCompleted:
+    post:
+      operationId: recommendationJobCallback
+      summary: Async job completion webhook delivered to caller's callback_url
+      description: >
+        Posted to the `callback_url` supplied in the original job request when the
+        job reaches `completed` or `failed` status. The receiving endpoint must
+        return HTTP 2xx within 10 seconds. Retried up to 3 times on failure.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [job_id, status, created_at, completed_at]
+              properties:
+                job_id:
+                  type: string
+                  format: uuid
+                  example: "7f3a9b2c-1d4e-5f6a-8b7c-9d0e1f2a3b4c"
+                status:
+                  type: string
+                  enum: [completed, failed]
+                  example: "completed"
+                model_version:
+                  type: string
+                  example: "v1.3.0-20260601"
+                created_at:
+                  type: string
+                  format: date-time
+                completed_at:
+                  type: string
+                  format: date-time
+                user_count:
+                  type: integer
+                  description: Number of users processed.
+                  example: 10000
+                result_url:
+                  type: string
+                  format: uri
+                  description: >
+                    Pre-signed GCS URL to download the NDJSON results file.
+                    Valid for 24 hours. Present only when status is `completed`.
+                  example: "https://storage.googleapis.com/retailco-results/jobs/7f3a9b2c.ndjson?X-Goog-Signature=..."
+                error:
+                  type: object
+                  description: Present only when status is `failed`.
+                  properties:
+                    code:
+                      type: string
+                      example: "FEATURE_STORE_TIMEOUT"
+                    message:
+                      type: string
+                      example: "Redis feature store timed out after 3 retries."
+            examples:
+              completed:
+                summary: Successful job completion
+                value:
+                  job_id: "7f3a9b2c-1d4e-5f6a-8b7c-9d0e1f2a3b4c"
+                  status: "completed"
+                  model_version: "v1.3.0-20260601"
+                  created_at: "2026-06-01T14:00:00Z"
+                  completed_at: "2026-06-01T14:01:23Z"
+                  user_count: 10000
+                  result_url: "https://storage.googleapis.com/retailco-results/jobs/7f3a9b2c.ndjson?X-Goog-Signature=..."
+              failed:
+                summary: Job failure callback
+                value:
+                  job_id: "8a4b1c3d-2e5f-6a7b-9c8d-0e1f2a3b4c5d"
+                  status: "failed"
+                  created_at: "2026-06-01T14:05:00Z"
+                  completed_at: "2026-06-01T14:05:45Z"
+                  user_count: 0
+                  error:
+                    code: "FEATURE_STORE_TIMEOUT"
+                    message: "Redis feature store timed out after 3 retries."
+      responses:
+        "2XX":
+          description: Caller acknowledged the webhook. No response body required.
+
+tags:
+  - name: Recommendations
+    description: Synchronous and batch recommendation endpoints
+  - name: Async Jobs
+    description: Long-running recommendation jobs for large cohorts
+  - name: Observability
+    description: Health and readiness probes (no authentication required)

@@ -1,0 +1,100 @@
+# deploy/inference/values.yaml
+# Default values for rec-inference.
+# Override per environment via values-staging.yaml or values-prod.yaml.
+
+# ---------------------------------------------------------------------------
+# Image
+# ---------------------------------------------------------------------------
+image:
+  repository: us-central1-docker.pkg.dev/retailco-prod/rec-images/rec-inference
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+# ---------------------------------------------------------------------------
+# Replica count (overridden per environment)
+# ---------------------------------------------------------------------------
+replicaCount: 2
+
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+# ---------------------------------------------------------------------------
+# Resource requests/limits (overridden per environment)
+# ---------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: "500m"
+    memory: "2Gi"
+  limits:
+    cpu: "2"
+    memory: "4Gi"
+
+# ---------------------------------------------------------------------------
+# Model artifact — mounted, NOT baked into the image.
+# The init container or sidecar pulls the artifact from GCS and places it
+# at modelArtifact.mountPath before the inference server starts.
+# ---------------------------------------------------------------------------
+modelArtifact:
+  mountPath: /mnt/models
+  # GCS source URI — overridden in env-specific values.
+  gcsBucket: gs://retailco-models
+
+# ---------------------------------------------------------------------------
+# Model version — patched by CI/CD (yq) at deploy time.
+# ---------------------------------------------------------------------------
+modelVersion: "v1.0.0"
+
+# ---------------------------------------------------------------------------
+# Environment variables passed to the inference container.
+# ---------------------------------------------------------------------------
+env:
+  MODEL_ARTIFACT_PATH: /mnt/models
+  MODEL_VERSION: "v1.0.0"
+  REDIS_URL: redis://redis-service:6379
+  PRODUCT_CATALOG_URL: http://catalog-service/api/v1
+  LOG_LEVEL: INFO
+
+# ---------------------------------------------------------------------------
+# Health and readiness probes
+# ---------------------------------------------------------------------------
+probes:
+  liveness:
+    path: /health
+    initialDelaySeconds: 30
+    periodSeconds: 15
+    failureThreshold: 3
+  readiness:
+    path: /ready
+    initialDelaySeconds: 20
+    periodSeconds: 10
+    failureThreshold: 3
+
+# ---------------------------------------------------------------------------
+# Horizontal Pod Autoscaler
+# ---------------------------------------------------------------------------
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 12
+  targetCPUUtilizationPercentage: 65
+
+# ---------------------------------------------------------------------------
+# Canary (disabled by default; enabled by CI/CD for prod canary deploys)
+# ---------------------------------------------------------------------------
+canary:
+  enabled: false
+  weight: 0
+
+# ---------------------------------------------------------------------------
+# Security context — run as non-root
+# ---------------------------------------------------------------------------
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false

@@ -1,0 +1,10 @@
+{
+  "user_id": "u_12345",
+  "context": "home_screen",
+  "limit": 20,
+  "exclude_item_ids": ["item_1111", "item_2222"],
+  "session_signals": {
+    "viewed_item_ids": ["item_3333", "item_4444"],
+    "cart_item_ids": ["item_5555"]
+  }
+}

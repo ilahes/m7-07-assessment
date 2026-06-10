@@ -1,0 +1,20 @@
+{
+  "requests": [
+    {
+      "user_id": "u_10001",
+      "context": "home_screen",
+      "limit": 20
+    },
+    {
+      "user_id": "u_10002",
+      "context": "home_screen",
+      "limit": 20,
+      "exclude_item_ids": ["item_3001"]
+    },
+    {
+      "user_id": "u_cold_00001",
+      "context": "home_screen",
+      "limit": 20
+    }
+  ]
+}

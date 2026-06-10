@@ -1,0 +1,57 @@
+{
+  "results": [
+    {
+      "user_id": "u_10001",
+      "recommendations": [
+        {
+          "item_id": "item_8001",
+          "score": 0.8912,
+          "rank": 1,
+          "title": "Yoga Mat Premium",
+          "category": "fitness/yoga",
+          "price_usd": 59.99,
+          "in_stock": true,
+          "image_url": "https://cdn.retailco.com/products/8001/main.jpg"
+        }
+      ],
+      "fallback_used": false,
+      "error": null
+    },
+    {
+      "user_id": "u_10002",
+      "recommendations": [
+        {
+          "item_id": "item_8002",
+          "score": 0.7654,
+          "rank": 1,
+          "title": "Wireless Earbuds - Sport",
+          "category": "electronics/audio",
+          "price_usd": 89.99,
+          "in_stock": true,
+          "image_url": "https://cdn.retailco.com/products/8002/main.jpg"
+        }
+      ],
+      "fallback_used": false,
+      "error": null
+    },
+    {
+      "user_id": "u_cold_00001",
+      "recommendations": [
+        {
+          "item_id": "item_9001",
+          "score": 0.6100,
+          "rank": 1,
+          "title": "Bestseller: Classic White Sneakers",
+          "category": "footwear/casual",
+          "price_usd": 79.99,
+          "in_stock": true,
+          "image_url": "https://cdn.retailco.com/products/9001/main.jpg"
+        }
+      ],
+      "fallback_used": true,
+      "error": null
+    }
+  ],
+  "model_version": "v1.3.0-20260601",
+  "total_latency_ms": 312
+}

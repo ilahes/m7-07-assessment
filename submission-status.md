@@ -1,1 +1,0 @@
-Assessment repository initialized. 

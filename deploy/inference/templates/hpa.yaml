@@ -1,0 +1,37 @@
+{{/* deploy/inference/templates/hpa.yaml */}}
+{{- if .Values.hpa.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rec-inference
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: rec-inference
+    app.kubernetes.io/name: rec-inference
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: rec-inference
+  minReplicas: {{ .Values.hpa.minReplicas }}
+  maxReplicas: {{ .Values.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.hpa.targetCPUUtilizationPercentage }}
+    # ---------------------------------------------------------------------------
+    # Future extension: scale on request rate via Prometheus adapter.
+    # Uncomment and configure when custom metrics adapter is available.
+    # ---------------------------------------------------------------------------
+    # - type: Pods
+    #   pods:
+    #     metric:
+    #       name: http_requests_per_second
+    #     target:
+    #       type: AverageValue
+    #       averageValue: "200"   # ~800 RPS / 4 pods baseline
+{{- end }}

@@ -1,0 +1,61 @@
+# deploy/inference/values-staging.yaml
+# Staging environment overrides — extends values.yaml.
+# Applied via: helm upgrade --values deploy/inference/values-staging.yaml
+
+# ---------------------------------------------------------------------------
+# Image — staging uses candidate tags; patched by CI/CD at deploy time.
+# ---------------------------------------------------------------------------
+image:
+  tag: "candidate-latest"   # replaced at runtime by yq in deploy-staging job
+
+# ---------------------------------------------------------------------------
+# Replicas — smaller footprint than production
+# ---------------------------------------------------------------------------
+replicaCount: 2
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+# ---------------------------------------------------------------------------
+# Resources — reduced for staging cluster cost efficiency
+# ---------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: "250m"
+    memory: "1Gi"
+  limits:
+    cpu: "1"
+    memory: "2Gi"
+
+# ---------------------------------------------------------------------------
+# Model version — patched by CI/CD at deploy time.
+# ---------------------------------------------------------------------------
+modelVersion: "v1.0.0-candidate"
+
+# ---------------------------------------------------------------------------
+# Environment variables — staging endpoints
+# ---------------------------------------------------------------------------
+env:
+  MODEL_ARTIFACT_PATH: /mnt/models
+  MODEL_VERSION: "v1.0.0-candidate"       # patched by CI/CD
+  REDIS_URL: redis://redis-staging.retailco.internal:6379
+  PRODUCT_CATALOG_URL: http://catalog-staging.retailco.internal/api/v1
+  LOG_LEVEL: DEBUG
+
+# ---------------------------------------------------------------------------
+# Health and readiness probes — same paths as production
+# ---------------------------------------------------------------------------
+probes:
+  liveness:
+    path: /health
+    initialDelaySeconds: 30
+    periodSeconds: 15
+    failureThreshold: 3
+  readiness:
+    path: /ready
+    initialDelaySeconds: 20
+    periodSeconds: 10
+    failureThreshold: 3

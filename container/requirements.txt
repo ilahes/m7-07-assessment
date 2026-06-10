@@ -1,0 +1,28 @@
+# ── rec-inference: Python dependencies ───────────────────────────
+# Pinned for reproducibility. Update via `pip-compile requirements.in`.
+# Note: onnxruntime-gpu requires a CUDA-compatible runtime host.
+#       The Dockerfile installs libgomp1 from apt; all CUDA binaries
+#       are bundled by the onnxruntime-gpu wheel itself.
+
+# Web framework & ASGI server
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+pydantic==2.7.1
+
+# ONNX inference (GPU provider — requires T4/A10G at runtime)
+onnxruntime-gpu==1.17.3
+
+# FAISS — ANN index for candidate retrieval
+faiss-gpu==1.7.4
+
+# GCS client — init container uses this to download model artifacts
+google-cloud-storage==2.16.0
+
+# Observability
+prometheus-client==0.20.0
+opentelemetry-sdk==1.24.0
+opentelemetry-exporter-gcp-trace==1.6.0
+
+# Utilities
+numpy==1.26.4
+structlog==24.1.0

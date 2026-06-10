@@ -1,0 +1,310 @@
+# Prometheus Alerting Rules — Recommendation Service
+# Aligned with SLO thresholds in serving/slos.yaml
+# Referenced by rollback triggers in runbooks/rollback.md
+
+groups:
+
+  # ── Availability: Multi-Window Burn-Rate ──────────────────────
+  - name: rec_availability
+    rules:
+      # CRITICAL: 1h burn rate > 14.4× (exhausts 30d budget in 2h)
+      - alert: RecAvailabilityBurnRateCritical
+        expr: |
+          (
+            1 - (
+              rate(http_requests_total{service="rec-api",status!~"5.."}[1h])
+              / rate(http_requests_total{service="rec-api",status!~"429"}[1h])
+            )
+          ) / (1 - 0.999) > 14.4
+        for: 2m
+        labels:
+          severity: critical
+          team: ml-platform
+          runbook: https://wiki.retailco.internal/runbooks/rec-rollback
+        annotations:
+          summary: "rec-api: availability error budget burning at critical rate (1h window)"
+          description: >
+            1-hour burn rate is {{ $value | humanize }}× the SLO budget (target ≤ 14.4×).
+            At this rate the monthly 43.2-minute downtime budget will be exhausted in ~2 hours.
+            Trigger rollback: see runbooks/rollback.md.
+
+      # WARNING: 6h burn rate > 6× (exhausts budget in 5 days)
+      - alert: RecAvailabilityBurnRateWarning
+        expr: |
+          (
+            1 - (
+              rate(http_requests_total{service="rec-api",status!~"5.."}[6h])
+              / rate(http_requests_total{service="rec-api",status!~"429"}[6h])
+            )
+          ) / (1 - 0.999) > 6.0
+        for: 15m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "rec-api: availability error budget burning at elevated rate (6h window)"
+          description: >
+            6-hour burn rate is {{ $value | humanize }}× the SLO budget.
+            Investigate but do not page immediately.
+
+  # ── p95 Latency ───────────────────────────────────────────────
+  - name: rec_latency
+    rules:
+      - alert: RecLatencyP95Breach
+        expr: |
+          histogram_quantile(
+            0.95,
+            rate(http_request_duration_ms_bucket{
+              service="rec-api",
+              endpoint="/v1/recommendations",
+              status=~"2.."
+            }[5m])
+          ) > 120
+        for: 3m
+        labels:
+          severity: critical
+          team: ml-platform
+          runbook: https://wiki.retailco.internal/runbooks/rec-rollback
+        annotations:
+          summary: "rec-api: p95 latency exceeds 120 ms SLO"
+          description: >
+            p95 latency for POST /v1/recommendations is {{ $value | humanize }}ms
+            (SLO: ≤ 120 ms). Sustained for 3 minutes.
+            Check: inference service GPU utilisation, Redis latency, pod count.
+            Trigger rollback: see runbooks/rollback.md.
+
+      - alert: RecLatencyP99Elevated
+        expr: |
+          histogram_quantile(
+            0.99,
+            rate(http_request_duration_ms_bucket{
+              service="rec-api",
+              endpoint="/v1/recommendations"
+            }[5m])
+          ) > 250
+        for: 5m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "rec-api: p99 latency elevated above 250 ms"
+          description: >
+            p99 latency is {{ $value | humanize }}ms. Not an SLO breach yet,
+            but warrants investigation before it escalates.
+
+  # ── Error Rate ────────────────────────────────────────────────
+  - name: rec_errors
+    rules:
+      - alert: RecErrorRateHigh
+        expr: |
+          rate(http_requests_total{service="rec-api",status=~"5.."}[5m])
+          / rate(http_requests_total{service="rec-api"}[5m]) > 0.005
+        for: 2m
+        labels:
+          severity: critical
+          team: ml-platform
+          runbook: https://wiki.retailco.internal/runbooks/rec-rollback
+        annotations:
+          summary: "rec-api: 5xx error rate exceeds 0.5% SLO"
+          description: >
+            5xx error rate is {{ $value | humanizePercentage }} over the last 5 minutes
+            (SLO: ≤ 0.5%). Sustained for 2 minutes.
+            Rollback trigger threshold reached: see runbooks/rollback.md.
+
+  # ── Model Version Mismatch ────────────────────────────────────
+  - name: rec_model_version
+    rules:
+      - alert: RecModelVersionMismatch
+        expr: |
+          count(
+            count by (model_version) (
+              rec_inference_requests_total{service="rec-inference"}
+            )
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "rec-inference: multiple model versions serving traffic simultaneously"
+          description: >
+            More than one distinct model_version label is active in rec_inference_requests_total.
+            This may indicate a stuck canary pod or a failed rolling update.
+            Expected during planned A/B deployments — suppress if experiment_id is set.
+            X-Model-Version header mismatch: check pod annotations vs Helm modelVersion value.
+
+      - alert: RecModelVersionStalledRollout
+        # Fires when any pod is serving a model_version that does NOT match the
+        # version declared in the rec_inference_expected_model_version gauge.
+        # That gauge is set by the Helm chart via a ConfigMap annotation and
+        # scraped as a static metric — no hardcoded version strings here.
+        expr: |
+          (
+            sum by (model_version) (
+              rate(rec_inference_requests_total{service="rec-inference"}[5m])
+            )
+            unless on (model_version)
+            rec_inference_expected_model_version{service="rec-inference"}
+          ) > 0
+        for: 30m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "rec-inference: unexpected model version serving traffic after 30 min"
+          description: >
+            A pod is serving traffic on a model_version that does not match the
+            expected version declared in rec_inference_expected_model_version.
+            This may indicate a stuck pod from a previous rollout.
+            Check: kubectl rollout status deployment/rec-inference -n recommendations.
+
+  # ── Feature Freshness ─────────────────────────────────────────
+  - name: rec_feature_freshness
+    rules:
+      - alert: RecFeatureStalenessHigh
+        expr: |
+          (time() - rec_feature_last_updated_timestamp_seconds{service="rec-api"}) > 7200
+        for: 5m
+        labels:
+          severity: warning
+          team: data-engineering
+        annotations:
+          summary: "rec-api: user feature vectors older than 2 hours"
+          description: >
+            The batch feature pipeline has not updated Redis features for
+            {{ $value | humanizeDuration }}. Feature vectors may be stale.
+            Check Dataflow pipeline status: https://console.cloud.google.com/dataflow
+
+      - alert: RecFeaturePipelineDown
+        expr: |
+          (time() - rec_feature_last_updated_timestamp_seconds{service="rec-api"}) > 14400
+        for: 5m
+        labels:
+          severity: critical
+          team: data-engineering
+        annotations:
+          summary: "rec-api: feature pipeline appears down — features older than 4 hours"
+          description: >
+            Feature vectors have not been refreshed for >4 hours.
+            Cold-start fallback rate will spike. Escalate to Data Engineering on-call.
+
+  # ── Cold-Start Fallback Spike ─────────────────────────────────
+  - name: rec_cold_start
+    rules:
+      - alert: RecColdStartSpike
+        expr: |
+          rate(rec_requests_total{fallback="true",service="rec-api"}[5m])
+          / rate(rec_requests_total{service="rec-api"}[5m]) > 0.15
+        for: 5m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "rec-api: cold-start fallback rate exceeds 15%"
+          description: >
+            {{ $value | humanizePercentage }} of requests are using popularity fallback
+            (threshold: 15%). Likely causes: Redis data loss, feature pipeline failure,
+            or a large cohort of new users during a marketing campaign.
+            Check rec_feature_last_updated_timestamp_seconds.
+
+  # ── Distribution Drift ────────────────────────────────────────
+  - name: rec_drift
+    rules:
+      - alert: RecFeatureDriftHigh
+        expr: rec_psi_score{service="rec-inference"} > 0.2
+        for: 0m    # alert immediately — PSI is computed hourly, not per-second
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "rec-inference: feature distribution drift PSI > 0.2 (retraining threshold)"
+          description: >
+            Population Stability Index (PSI) for feature dimension {{ $labels.feature }}
+            is {{ $value }}. PSI > 0.2 triggers an automatic retraining pipeline run.
+            If automatic trigger fails, run manually: make trigger-retrain.
+
+      - alert: RecPredictionScoreDrift
+        expr: |
+          abs(
+            avg(rec_recommendation_score{service="rec-inference"}) -
+            avg_over_time(rec_recommendation_score{service="rec-inference"}[7d])
+          ) > 0.15
+        for: 30m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "rec-inference: recommendation score distribution shifted significantly"
+          description: >
+            The mean recommendation score has shifted by {{ $value }} vs the 7-day baseline.
+            This may indicate a model regression or data pipeline issue.
+
+  # ── Experiment Service Health ─────────────────────────────────
+  - name: rec_experiment_service
+    rules:
+      - alert: RecExperimentServiceDegraded
+        # Fires when the circuit breaker in the Recommendation API trips —
+        # i.e. 3 consecutive timeouts to the Experiment Service, causing
+        # fallback to the control variant. Metric emitted by rec-api pods.
+        expr: |
+          rate(rec_experiment_service_fallback_total{service="rec-api"}[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "rec-api: Experiment Service circuit breaker open — falling back to control variant"
+          description: >
+            The Recommendation API cannot reach the Experiment Service and has
+            activated the circuit breaker fallback (all traffic → control variant).
+            Active A/B experiments are paused. Check Experiment Service pod status:
+            kubectl get pods -n recommendations -l app=experiment-service.
+
+  # ── A/B Experiment Guardrail ──────────────────────────────────
+  - name: rec_ab_guardrail
+    rules:
+      - alert: RecABGuardrailCTRDrop
+        expr: |
+          (
+            rate(rec_ctr_events_total{variant="treatment"}[1h])
+            / rate(rec_impression_events_total{variant="treatment"}[1h])
+          )
+          /
+          (
+            rate(rec_ctr_events_total{variant="control"}[1h])
+            / rate(rec_impression_events_total{variant="control"}[1h])
+          ) < 0.97
+        for: 30m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "rec A/B: treatment CTR is >3% below control for 30 min"
+          description: >
+            Experiment {{ $labels.experiment_id }}: treatment CTR is
+            {{ $value | humanizePercentage }} of control CTR.
+            If this persists, consider stopping the experiment and rolling back
+            to the control model. Notify product team in #experiments.
+
+      - alert: RecABGuardrailAddToCartDrop
+        expr: |
+          (
+            rate(rec_add_to_cart_events_total{variant="treatment"}[1h])
+            / rate(rec_impression_events_total{variant="treatment"}[1h])
+          )
+          /
+          (
+            rate(rec_add_to_cart_events_total{variant="control"}[1h])
+            / rate(rec_impression_events_total{variant="control"}[1h])
+          ) < 0.95
+        for: 60m
+        labels:
+          severity: critical
+          team: ml-platform
+          runbook: https://wiki.retailco.internal/runbooks/rec-rollback
+        annotations:
+          summary: "rec A/B: treatment add-to-cart rate is >5% below control for 60 min"
+          description: >
+            Experiment {{ $labels.experiment_id }}: treatment add-to-cart rate is critically
+            below control. This exceeds the guardrail threshold. Stop the experiment and
+            roll back: see runbooks/rollback.md.

@@ -1,0 +1,90 @@
+# SLO Definitions — Recommendation Service
+# These SLOs are the contractual thresholds monitored in monitoring/alerts.yaml
+# and referenced in runbooks/rollback.md.
+
+service: recommendation-api
+version: "1.0"
+owner: "ml-platform@retailco.com"
+review_cadence: quarterly
+
+slos:
+  # ── Availability SLO ──────────────────────────────────────────
+  - name: availability
+    description: >
+      Fraction of HTTP requests that return a non-5xx response,
+      measured at the API Gateway. Excludes requests rejected by
+      rate-limiting (429) which are client-side violations.
+    target: 0.999          # 99.9% — 43.2 minutes downtime budget per month
+    window: 30d
+    indicator:
+      type: ratio
+      good_events: "http_requests_total{status!~'5..',service='rec-api'}"
+      total_events: "http_requests_total{service='rec-api',status!~'429'}"
+    error_budget_minutes_per_month: 43.2
+    alert_ref: RecAvailabilityBurnRateCritical
+
+  # ── p95 Latency SLO ───────────────────────────────────────────
+  - name: latency_p95
+    description: >
+      95th-percentile end-to-end response latency measured at the
+      API Gateway, for all successful (2xx) sync recommendation
+      requests (POST /v1/recommendations). Budget: 120 ms.
+    target: 0.95           # 95% of requests under 120 ms
+    window: 30d
+    indicator:
+      type: threshold
+      metric: "histogram_quantile(0.95, rate(http_request_duration_ms_bucket{service='rec-api',endpoint='/v1/recommendations',status=~'2..'}[5m]))"
+      threshold_ms: 120
+    alert_ref: RecLatencyP95Breach
+
+  # ── Error Rate SLO ────────────────────────────────────────────
+  - name: error_rate
+    description: >
+      5xx error rate must not exceed 0.5% over any 5-minute window.
+      Evaluated as a point-in-time threshold rather than a rolling
+      budget, because a sudden spike is operationally unacceptable
+      regardless of prior clean periods.
+    target: 0.005          # ≤ 0.5% error rate
+    window: 5m             # rolling window for alert evaluation
+    indicator:
+      type: ratio
+      bad_events: "http_requests_total{status=~'5..',service='rec-api'}"
+      total_events: "http_requests_total{service='rec-api'}"
+    alert_ref: RecErrorRateHigh
+
+  # ── Cold-Start Fallback Rate ──────────────────────────────────
+  - name: cold_start_fallback_rate
+    description: >
+      Rate of cold-start (popularity fallback) responses as a
+      fraction of total recommendation requests. A spike above 15%
+      indicates feature pipeline failure or Redis data loss.
+    target: 0.85           # ≥ 85% of requests must use personalized (non-fallback) path
+    window: 5m
+    indicator:
+      type: ratio
+      good_events: "rec_requests_total{fallback='false',service='rec-api'}"
+      total_events: "rec_requests_total{service='rec-api'}"
+    alert_ref: RecColdStartSpike
+
+error_budget_policy:
+  burn_rate_thresholds:
+    # 1h window: if burn rate > 14.4×, you'll exhaust the monthly budget in 2 hours
+    - window: 1h
+      burn_rate: 14.4
+      severity: critical
+      page: true
+    # 6h window: if burn rate > 6×, you'll exhaust the monthly budget in 5 days
+    - window: 6h
+      burn_rate: 6.0
+      severity: warning
+      page: false
+    # 3d window: if burn rate > 1×, error budget is being consumed faster than it refills
+    - window: 3d
+      burn_rate: 1.0
+      severity: info
+      page: false
+  freeze_policy: >
+    When error budget is < 10% remaining in the current 30-day window,
+    no new model versions are promoted to production without explicit
+    VP Engineering approval. This is enforced as a manual gate in
+    the CI/CD pipeline's production approval step.

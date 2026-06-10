@@ -1,0 +1,71 @@
+# deploy/inference/values-prod.yaml
+# Production environment overrides — extends values.yaml.
+# Applied via: helm upgrade --values deploy/inference/values-prod.yaml
+#
+# Replica count is sized to sustain 800 RPS peak with p95 latency ≤ 120 ms
+# (see serving/capacity-plan.md for full derivation).
+
+# ---------------------------------------------------------------------------
+# Image — production tag patched by CI/CD at deploy time.
+# ---------------------------------------------------------------------------
+image:
+  tag: "stable-latest"   # replaced at runtime by yq in deploy-production job
+
+# ---------------------------------------------------------------------------
+# Replicas — production sizing; CI/CD manages canary vs full via canary.*
+# ---------------------------------------------------------------------------
+replicaCount: 4
+
+hpa:
+  enabled: true
+  minReplicas: 4
+  maxReplicas: 12
+  targetCPUUtilizationPercentage: 65
+
+# ---------------------------------------------------------------------------
+# Resources — production-grade requests/limits
+# ---------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: "1"
+    memory: "3Gi"
+  limits:
+    cpu: "2"
+    memory: "5Gi"
+
+# ---------------------------------------------------------------------------
+# Model version — patched by CI/CD at deploy time.
+# ---------------------------------------------------------------------------
+modelVersion: "v1.0.0"
+
+# ---------------------------------------------------------------------------
+# Environment variables — production endpoints
+# ---------------------------------------------------------------------------
+env:
+  MODEL_ARTIFACT_PATH: /mnt/models
+  MODEL_VERSION: "v1.0.0"                 # patched by CI/CD
+  REDIS_URL: redis://redis-prod.retailco.internal:6379
+  PRODUCT_CATALOG_URL: http://catalog-prod.retailco.internal/api/v1
+  LOG_LEVEL: WARNING
+
+# ---------------------------------------------------------------------------
+# Canary — managed by CI/CD; not set manually here.
+# ---------------------------------------------------------------------------
+canary:
+  enabled: false
+  weight: 0
+
+# ---------------------------------------------------------------------------
+# Health and readiness probes — same paths as staging
+# ---------------------------------------------------------------------------
+probes:
+  liveness:
+    path: /health
+    initialDelaySeconds: 30
+    periodSeconds: 15
+    failureThreshold: 3
+  readiness:
+    path: /ready
+    initialDelaySeconds: 20
+    periodSeconds: 10
+    failureThreshold: 3

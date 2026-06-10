@@ -1,0 +1,480 @@
+name: Build → Scan → Stage → Load Test → Deploy Model
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "container/**"
+      - "api/**"
+      - "deploy/**"
+      - ".github/workflows/deploy-model.yml"
+  workflow_dispatch:
+    inputs:
+      model_version:
+        description: "Model version to deploy (e.g. v1.3.0-20260601). Leave blank to use registry latest-candidate."
+        required: false
+        default: ""
+      force_deploy:
+        description: "Skip load test gate (emergency use only — requires reason)"
+        type: boolean
+        default: false
+      force_reason:
+        description: "Reason for skipping load test (required if force_deploy=true)"
+        required: false
+
+env:
+  PROJECT_ID: retailco-prod
+  REGION: us-central1
+  ARTIFACT_REGISTRY: us-central1-docker.pkg.dev/retailco-prod/rec-images
+  GCS_MODELS_BUCKET: gs://retailco-models
+  GCS_ARTIFACTS_BUCKET: gs://retailco-cicd-artifacts
+  IMAGE_NAME: rec-inference
+  K8S_CLUSTER: retailco-gke-prod
+  K8S_NAMESPACE: recommendations
+
+jobs:
+  # ── 1. Lint & Unit Tests ───────────────────────────────────────
+  lint-and-test:
+    name: Lint & Unit Tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check src/ tests/
+
+      - name: Type check (mypy)
+        run: mypy src/ --ignore-missing-imports
+
+      - name: Unit tests
+        run: pytest tests/unit/ -v --tb=short --cov=src --cov-report=xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+
+  # ── 2. OpenAPI Lint ────────────────────────────────────────────
+  openapi-lint:
+    name: OpenAPI Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Redocly CLI
+        run: npm install -g @redocly/cli@1.14.0
+
+      - name: Lint OpenAPI spec
+        run: redocly lint api/openapi.yaml --format=stylish
+
+      - name: Validate examples
+        run: redocly bundle api/openapi.yaml --output /dev/null
+
+  # ── 3. Docker Build ────────────────────────────────────────────
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-22.04
+    needs: [lint-and-test, openapi-lint]
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          GIT_SHA=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +%Y%m%d)
+          IMAGE_TAG="${GIT_SHA}-${BUILD_DATE}"
+          IMAGE_URI="${{ env.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "image_uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+          echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
+          echo "Building image: ${IMAGE_URI}"
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: container/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.image_uri }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          cache-from: type=registry,ref=${{ env.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+  # ── 4. Security Scan ──────────────────────────────────────────
+  security-scan:
+    name: Security Scan (Trivy)
+    runs-on: ubuntu-22.04
+    needs: docker-build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.docker-build.outputs.image_uri }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1"        # Fail on CRITICAL CVEs
+          ignore-unfixed: true  # Ignore CVEs with no available fix
+
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ── 5. Model Registry Validation ──────────────────────────────
+  validate-model-registry:
+    name: Validate Model Registry
+    runs-on: ubuntu-22.04
+    needs: [lint-and-test]
+    outputs:
+      model_version: ${{ steps.resolve.outputs.model_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Resolve model version
+        id: resolve
+        run: |
+          if [ -n "${{ github.event.inputs.model_version }}" ]; then
+            MODEL_VERSION="${{ github.event.inputs.model_version }}"
+          else
+            # Fetch latest candidate from MLflow registry via API
+            MODEL_VERSION=$(python scripts/get_latest_candidate.py)
+          fi
+          echo "Resolved model version: ${MODEL_VERSION}"
+          echo "model_version=${MODEL_VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Verify model artifact exists in GCS
+        run: |
+          MODEL_VERSION=${{ steps.resolve.outputs.model_version }}
+          gsutil stat "${{ env.GCS_MODELS_BUCKET }}/rec-model-${MODEL_VERSION}.onnx" \
+            || (echo "ERROR: Model artifact not found in GCS for version ${MODEL_VERSION}" && exit 1)
+          gsutil stat "${{ env.GCS_MODELS_BUCKET }}/rec-index-${MODEL_VERSION}.faiss" \
+            || (echo "ERROR: FAISS index not found in GCS for version ${MODEL_VERSION}" && exit 1)
+
+      - name: Verify model registry state is 'candidate' or 'staging'
+        run: |
+          MODEL_VERSION=${{ steps.resolve.outputs.model_version }}
+          python scripts/check_registry_state.py \
+            --model-name rec-two-tower-v1 \
+            --version "${MODEL_VERSION}" \
+            --allowed-states candidate staging
+          echo "Model registry state: OK"
+
+      - name: Verify feature schema version matches serving config
+        run: |
+          MODEL_VERSION=${{ steps.resolve.outputs.model_version }}
+          python scripts/check_feature_schema_match.py \
+            --model-version "${MODEL_VERSION}" \
+            --serving-config deploy/inference/values.yaml
+          echo "Feature schema match: OK"
+
+  # ── 6. Deploy to Staging ──────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-22.04
+    needs: [docker-build, security-scan, validate-model-registry]
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Get GKE credentials (staging)
+        run: |
+          gcloud container clusters get-credentials retailco-gke-staging \
+            --region ${{ env.REGION }} --project ${{ env.PROJECT_ID }}
+
+      - name: Update Helm values for staging
+        run: |
+          IMAGE_TAG=${{ needs.docker-build.outputs.image_tag }}
+          MODEL_VERSION=${{ needs.validate-model-registry.outputs.model_version }}
+          # Patch staging values file
+          yq e ".image.tag = \"${IMAGE_TAG}\"" -i deploy/inference/values-staging.yaml
+          yq e ".modelVersion = \"${MODEL_VERSION}\"" -i deploy/inference/values-staging.yaml
+
+      - name: Helm upgrade (staging)
+        run: |
+          helm upgrade --install rec-inference deploy/inference \
+            --namespace ${{ env.K8S_NAMESPACE }} \
+            --values deploy/inference/values-staging.yaml \
+            --set image.repository=${{ env.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }} \
+            --wait --timeout 5m
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/rec-inference \
+            -n ${{ env.K8S_NAMESPACE }} --timeout=300s
+          kubectl rollout status deployment/rec-api \
+            -n ${{ env.K8S_NAMESPACE }} --timeout=300s
+
+  # ── 7. Smoke Test ─────────────────────────────────────────────
+  smoke-test:
+    name: Smoke Test (Staging)
+    runs-on: ubuntu-22.04
+    needs: deploy-staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Newman
+        run: npm install -g newman@6
+
+      - name: Run API smoke tests
+        run: |
+          newman run tests/smoke/recommendation-api.postman_collection.json \
+            --environment tests/smoke/staging.postman_environment.json \
+            --env-var "api_token=${{ secrets.STAGING_API_TOKEN }}" \
+            --reporters cli,junit \
+            --reporter-junit-export results/smoke-results.xml
+        env:
+          STAGING_BASE_URL: https://api-staging.retailco.com/rec/v1
+
+      - name: Upload smoke test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-results
+          path: results/smoke-results.xml
+
+  # ── 8. Load Test Gate ─────────────────────────────────────────
+  load-test:
+    name: Load Test Gate (800 RPS · 10 min)
+    runs-on: ubuntu-22.04
+    needs: smoke-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check force_deploy flag
+        if: ${{ github.event.inputs.force_deploy == 'true' }}
+        run: |
+          if [ -z "${{ github.event.inputs.force_reason }}" ]; then
+            echo "ERROR: force_deploy=true requires force_reason to be set."
+            exit 1
+          fi
+          echo "WARNING: Skipping load test. Reason: ${{ github.event.inputs.force_reason }}"
+          echo "This bypass is recorded in the audit log."
+
+      - name: Install k6
+        if: ${{ github.event.inputs.force_deploy != 'true' }}
+        run: |
+          curl https://github.com/grafana/k6/releases/download/v0.51.0/k6-v0.51.0-linux-amd64.tar.gz \
+            -Lo k6.tar.gz -L
+          tar -xzf k6.tar.gz && sudo mv k6-v0.51.0-linux-amd64/k6 /usr/local/bin/k6
+
+      - name: Run load test
+        if: ${{ github.event.inputs.force_deploy != 'true' }}
+        run: |
+          mkdir -p results
+          k6 run \
+            --env BASE_URL=https://api-staging.retailco.com/rec/v1 \
+            --env API_TOKEN=${{ secrets.STAGING_API_TOKEN }} \
+            --out json=results/k6-results.json \
+            serving/k6/scenarios/steady_state.js
+        # k6 exits non-zero if thresholds are breached (p95 > 120 ms or error rate > 0.5%)
+
+      - name: Upload load test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-results
+          path: results/k6-results.json
+
+      - name: Upload results to GCS
+        if: always()
+        run: |
+          gsutil cp results/k6-results.json \
+            ${{ env.GCS_ARTIFACTS_BUCKET }}/load-tests/${{ github.run_id }}/k6-results.json
+
+  # ── 9. Production Approval ────────────────────────────────────
+  production-approval:
+    name: Manual Production Approval
+    runs-on: ubuntu-22.04
+    needs: load-test
+    environment: production   # GitHub environment with required reviewers: @retailco/ml-leads
+    steps:
+      - name: Approval checkpoint
+        run: |
+          echo "Production deployment approved by: ${{ github.actor }}"
+          echo "Model version: ${{ needs.validate-model-registry.outputs.model_version }}"
+          echo "Image tag: ${{ needs.docker-build.outputs.image_tag }}"
+
+  # ── 10. Deploy to Production (Canary) ─────────────────────────
+  deploy-production:
+    name: Deploy to Production (5% Canary)
+    runs-on: ubuntu-22.04
+    needs: [production-approval, validate-model-registry, docker-build]
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Get GKE credentials (production)
+        run: |
+          gcloud container clusters get-credentials ${{ env.K8S_CLUSTER }} \
+            --region ${{ env.REGION }} --project ${{ env.PROJECT_ID }}
+
+      - name: Update Helm values for production canary
+        run: |
+          IMAGE_TAG=${{ needs.docker-build.outputs.image_tag }}
+          MODEL_VERSION=${{ needs.validate-model-registry.outputs.model_version }}
+          yq e ".image.tag = \"${IMAGE_TAG}\"" -i deploy/inference/values-prod.yaml
+          yq e ".modelVersion = \"${MODEL_VERSION}\"" -i deploy/inference/values-prod.yaml
+          # Initial canary: 1 of 4 inference pods runs new version (25% traffic)
+          # Experiment service will further split to 5% via A/B assignment
+          yq e ".canary.enabled = true" -i deploy/inference/values-prod.yaml
+          yq e ".canary.weight = 5" -i deploy/inference/values-prod.yaml
+
+      - name: Helm upgrade (production canary)
+        run: |
+          helm upgrade --install rec-inference deploy/inference \
+            --namespace ${{ env.K8S_NAMESPACE }} \
+            --values deploy/inference/values-prod.yaml \
+            --set image.repository=${{ env.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }} \
+            --wait --timeout 5m
+
+      - name: Update model registry state to 'staging'
+        run: |
+          MODEL_VERSION=${{ needs.validate-model-registry.outputs.model_version }}
+          python scripts/update_registry_state.py \
+            --model-name rec-two-tower-v1 \
+            --version "${MODEL_VERSION}" \
+            --state staging \
+            --promoted-by "${{ github.actor }}"
+
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_DEPLOYMENTS }}
+          slack-bot-token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "text": "🚀 *rec-inference canary deployed*",
+              "attachments": [{
+                "color": "good",
+                "fields": [
+                  {"title": "Model Version", "value": "${{ needs.validate-model-registry.outputs.model_version }}", "short": true},
+                  {"title": "Image Tag", "value": "${{ needs.docker-build.outputs.image_tag }}", "short": true},
+                  {"title": "Traffic Split", "value": "5% canary", "short": true},
+                  {"title": "Deployed by", "value": "${{ github.actor }}", "short": true}
+                ]
+              }]
+            }
+
+  # ── 11. Full Production Promotion (100% traffic) ───────────────
+  # Triggered manually after A/B test runs 48–72 h and product team
+  # confirms business metrics are within guardrail (see lifecycle.md step 15).
+  promote-production:
+    name: Promote to Full Production (100% traffic)
+    runs-on: ubuntu-22.04
+    needs: [deploy-production, validate-model-registry, docker-build]
+    environment: production-promote   # GitHub environment — requires separate approval from @retailco/ml-leads
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.model_version != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Get GKE credentials (production)
+        run: |
+          gcloud container clusters get-credentials ${{ env.K8S_CLUSTER }} \
+            --region ${{ env.REGION }} --project ${{ env.PROJECT_ID }}
+
+      - name: Verify A/B test gate before full promotion
+        run: |
+          MODEL_VERSION=${{ needs.validate-model-registry.outputs.model_version }}
+          # This script checks MLflow registry that ab_test_ctr_lift > 0 AND p_value <= 0.05
+          python scripts/check_registry_state.py \
+            --model-name rec-two-tower-v1 \
+            --version "${MODEL_VERSION}" \
+            --allowed-states staging
+          python scripts/check_ab_test_gate.py \
+            --model-name rec-two-tower-v1 \
+            --version "${MODEL_VERSION}"
+          echo "A/B test gate: passed"
+
+      - name: Helm upgrade — disable canary, route 100% traffic to new version
+        run: |
+          IMAGE_TAG=${{ needs.docker-build.outputs.image_tag }}
+          MODEL_VERSION=${{ needs.validate-model-registry.outputs.model_version }}
+          yq e ".canary.enabled = false" -i deploy/inference/values-prod.yaml
+          yq e ".canary.weight = 100" -i deploy/inference/values-prod.yaml
+          helm upgrade rec-inference deploy/inference \
+            --namespace ${{ env.K8S_NAMESPACE }} \
+            --values deploy/inference/values-prod.yaml \
+            --set image.repository=${{ env.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }} \
+            --wait --timeout 5m
+
+      - name: Update model registry state to 'production'
+        run: |
+          MODEL_VERSION=${{ needs.validate-model-registry.outputs.model_version }}
+          python scripts/update_registry_state.py \
+            --model-name rec-two-tower-v1 \
+            --version "${MODEL_VERSION}" \
+            --state production \
+            --promoted-by "${{ github.actor }}"
+          # Archive the previous production version
+          python scripts/archive_previous_production.py \
+            --model-name rec-two-tower-v1 \
+            --superseded-by "${MODEL_VERSION}"
+
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_DEPLOYMENTS }}
+          slack-bot-token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "text": "✅ *rec-inference fully promoted to production (100% traffic)*",
+              "attachments": [{
+                "color": "good",
+                "fields": [
+                  {"title": "Model Version", "value": "${{ needs.validate-model-registry.outputs.model_version }}", "short": true},
+                  {"title": "Image Tag", "value": "${{ needs.docker-build.outputs.image_tag }}", "short": true},
+                  {"title": "Promoted by", "value": "${{ github.actor }}", "short": true}
+                ]
+              }]
+            }

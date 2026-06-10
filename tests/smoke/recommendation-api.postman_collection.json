@@ -1,0 +1,147 @@
+{
+  "_comment": "Smoke test collection for rec-inference API. All endpoints match api/openapi.yaml.",
+  "info": {
+    "name": "Recommendation API — Smoke Tests",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "GET /health (liveness)",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/health"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "pm.test('status ok', () => pm.expect(pm.response.json().status).to.eql('ok'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "GET /ready (readiness)",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/ready"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "pm.test('status ready', () => pm.expect(pm.response.json().status).to.eql('ready'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "POST /v1/recommendations (sync)",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/v1/recommendations",
+        "header": [
+          {"key": "Content-Type", "value": "application/json"},
+          {"key": "Authorization", "value": "Bearer {{api_token}}"}
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"user_id\":\"u_smoke_01\",\"context\":\"home_screen\",\"limit\":5}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "pm.test('has recommendations', () => pm.expect(pm.response.json()).to.have.property('recommendations'));",
+              "pm.test('has X-Model-Version header', () => pm.expect(pm.response.headers.get('X-Model-Version')).to.not.be.empty);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "POST /v1/recommendations:batch",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/v1/recommendations:batch",
+        "header": [
+          {"key": "Content-Type", "value": "application/json"},
+          {"key": "Authorization", "value": "Bearer {{api_token}}"}
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"requests\":[{\"user_id\":\"u_smoke_01\",\"context\":\"home_screen\",\"limit\":5},{\"user_id\":\"u_smoke_02\",\"context\":\"home_screen\",\"limit\":5}]}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "pm.test('has results array', () => pm.expect(pm.response.json().results).to.be.an('array'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "POST /v1/recommendation-jobs (async submit)",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/v1/recommendation-jobs",
+        "header": [
+          {"key": "Content-Type", "value": "application/json"},
+          {"key": "Authorization", "value": "Bearer {{api_token}}"}
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"user_ids\":[\"u_smoke_01\",\"u_smoke_02\"],\"context\":\"home_screen\",\"limit\":10,\"callback_url\":\"https://example.com/callback\"}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 202', () => pm.response.to.have.status(202));",
+              "pm.test('has job_id', () => pm.expect(pm.response.json().job_id).to.not.be.empty);",
+              "const jobId = pm.response.json().job_id;",
+              "pm.environment.set('last_job_id', jobId);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "GET /v1/recommendation-jobs/{job_id} (async status)",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/v1/recommendation-jobs/{{last_job_id}}",
+        "header": [
+          {"key": "Authorization", "value": "Bearer {{api_token}}"}
+        ]
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200 or 202', () => [200, 202].includes(pm.response.code));",
+              "pm.test('has status field', () => pm.expect(pm.response.json()).to.have.property('status'));"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

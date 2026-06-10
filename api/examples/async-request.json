@@ -1,0 +1,7 @@
+{
+  "user_ids": ["u_10001", "u_10002", "u_10003", "u_cold_00001"],
+  "context": "home_screen",
+  "limit": 20,
+  "callback_url": "https://internal.retailco.com/webhooks/rec-batch-done",
+  "priority": "normal"
+}

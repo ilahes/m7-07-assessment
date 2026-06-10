@@ -1,0 +1,25 @@
+{{/* deploy/inference/templates/configmap.yaml */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rec-inference-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: rec-inference
+    app.kubernetes.io/name: rec-inference
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+data:
+  # ---------------------------------------------------------------------------
+  # Non-secret operational configuration.
+  # Secret values (credentials, tokens) are injected via Kubernetes Secrets
+  # or Workload Identity — never stored here.
+  # ---------------------------------------------------------------------------
+  MODEL_VERSION: {{ .Values.modelVersion | quote }}
+  LOG_LEVEL: {{ .Values.env.LOG_LEVEL | quote }}
+
+  # Health and readiness endpoint paths — must match probe config in deployment.yaml.
+  LIVENESS_PATH: {{ .Values.probes.liveness.path | quote }}
+  READINESS_PATH: {{ .Values.probes.readiness.path | quote }}
+
+  # Model artifact mount location inside the container.
+  MODEL_ARTIFACT_PATH: {{ .Values.modelArtifact.mountPath | quote }}

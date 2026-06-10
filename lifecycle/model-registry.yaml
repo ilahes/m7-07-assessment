@@ -1,0 +1,145 @@
+# Model Registry Specification
+# Single source of truth for model lineage, approval state, and serving configuration.
+# Backed by: MLflow Tracking Server (GCP Cloud SQL + GCS artifact store)
+# GCS path: gs://retailco-models/
+
+schema_version: "1.2"
+
+model_name: rec-two-tower-v1
+
+# ──────────────────────────────────────────────
+# Current production entry (example)
+# ──────────────────────────────────────────────
+entries:
+  - version: "v1.3.0-20260601"
+    state: production          # candidate | staging | production | archived | rolled-back
+    promoted_at: "2026-06-01T14:32:00Z"
+    promoted_by: "alice@retailco.com"
+    approved_by: "bob@retailco.com"   # ML lead manual approval
+
+    artifacts:
+      onnx_model:
+        uri: "gs://retailco-models/rec-model-v1.3.0-20260601.onnx"
+        size_bytes: 462000000         # 462 MB
+        sha256: "a3f9c12d8e4b7c6a..."  # truncated for readability
+      faiss_index:
+        uri: "gs://retailco-models/rec-index-v1.3.0-20260601.faiss"
+        size_bytes: 890000000         # 890 MB
+        sha256: "b7e2d91f3a5c8b4d..."
+
+    training:
+      pipeline_run_id: "vertex-pipeline-run-20260531-abc123"
+      framework: pytorch-2.2
+      export_format: onnx-opset-17
+      training_data_window: "2026-05-01 to 2026-05-31"
+      training_completed_at: "2026-05-31T22:14:00Z"
+      hardware: "4x A100 40GB"
+      training_duration_hours: 5.8
+
+    feature_schema:
+      version: "v3"
+      redis_key_pattern: "user:{user_id}:features:v3"
+      feature_count: 394
+      schema_uri: "gs://retailco-schemas/user-features-v3.json"
+
+    evaluation:
+      test_set_window: "2026-05-18 to 2026-05-31"
+      metrics:
+        ndcg_at_10: 0.412
+        mrr: 0.238
+        catalog_coverage_at_10: 0.387
+        cold_start_ndcg_at_10: 0.234
+      regression_vs_previous:
+        ndcg_at_10_delta: +0.018    # +1.8% vs v1.2.1-20260515
+      bias_check: passed
+      fairness_check: passed
+
+    serving:
+      model_version_env: "MODEL_VERSION=v1.3.0-20260601"
+      feature_schema_version_env: "FEATURE_SCHEMA_VERSION=v3"
+      onnx_runtime_version: "1.17.1"
+      recommended_replicas: 6
+      gpu_required: true
+      gpu_type: "nvidia-tesla-t4"
+
+    online_metrics:
+      ab_test_id: "exp-20260601-challenger"
+      ab_test_duration_hours: 68
+      ctr_lift_vs_control: +0.023     # +2.3%
+      add_to_cart_lift_vs_control: +0.011
+      revenue_per_session_lift: +0.018
+      p_value: 0.031                  # < 0.05 threshold
+
+    lineage:
+      parent_version: "v1.2.1-20260515"
+      changelog: "Extended negative mining window from 7 to 14 days; added price-sensitivity feature."
+
+  # ──────────────────────────────────────────────
+  # Previous production (archived after v1.3.0 promotion)
+  # ──────────────────────────────────────────────
+  - version: "v1.2.1-20260515"
+    state: archived
+    promoted_at: "2026-05-15T10:00:00Z"
+    promoted_by: "charlie@retailco.com"
+    approved_by: "bob@retailco.com"
+
+    artifacts:
+      onnx_model:
+        uri: "gs://retailco-models/rec-model-v1.2.1-20260515.onnx"
+        size_bytes: 459000000
+        sha256: "c9d4e82f1b3a7e5f..."
+      faiss_index:
+        uri: "gs://retailco-models/rec-index-v1.2.1-20260515.faiss"
+        size_bytes: 885000000
+        sha256: "d1e3f94g2c5b8a6e..."
+
+    feature_schema:
+      version: "v3"
+      redis_key_pattern: "user:{user_id}:features:v3"
+
+    evaluation:
+      metrics:
+        ndcg_at_10: 0.394
+        mrr: 0.221
+        catalog_coverage_at_10: 0.371
+        cold_start_ndcg_at_10: 0.218
+      bias_check: passed
+      fairness_check: passed
+
+    serving:
+      model_version_env: "MODEL_VERSION=v1.2.1-20260515"
+      feature_schema_version_env: "FEATURE_SCHEMA_VERSION=v3"
+      onnx_runtime_version: "1.17.1"
+
+    lineage:
+      parent_version: "v1.2.0-20260501"
+      changelog: "Hotfix: corrected item embedding normalisation bug."
+
+# ──────────────────────────────────────────────
+# Registry gates: conditions that must pass for state transitions
+# ──────────────────────────────────────────────
+promotion_gates:
+  candidate_to_staging:
+    - ndcg_at_10 >= 0.38
+    - mrr >= 0.22
+    - catalog_coverage_at_10 >= 0.35
+    - cold_start_ndcg_at_10 >= 0.21
+    - bias_check == passed
+    - fairness_check == passed
+    - onnx_export_parity_check == passed   # cosine sim delta < 1e-4
+
+  staging_to_production:
+    - smoke_test == passed
+    - load_test_p95_ms <= 120
+    - load_test_error_rate_pct <= 0.5
+    - manual_approval == true
+    - ab_test_ctr_lift > 0                # any positive lift in online test
+    - ab_test_p_value <= 0.05
+
+  production_to_archived:
+    - superseded_by: required             # must name a production version
+
+  any_to_rolled_back:
+    - rollback_reason: required
+    - rolled_back_by: required
+    - rolled_back_at: required

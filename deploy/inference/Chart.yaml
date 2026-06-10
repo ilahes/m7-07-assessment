@@ -1,0 +1,20 @@
+apiVersion: v2
+name: rec-inference
+description: >
+  Helm chart for the Scenario X recommendation inference service.
+  Deploys the two-tower ONNX model + FAISS index as a mounted artifact
+  on Google Kubernetes Engine for the B2C retail mobile app.
+type: application
+# Chart version — bump when chart structure changes.
+version: 0.3.0
+# appVersion tracks the canonical model/service release tag.
+# Overridden per environment via values-staging.yaml / values-prod.yaml.
+appVersion: "v1.0.0"
+keywords:
+  - recommendations
+  - inference
+  - onnx
+  - faiss
+maintainers:
+  - name: ml-platform-team
+    email: ml-platform@retailco.com

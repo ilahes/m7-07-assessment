@@ -1,0 +1,2 @@
+# Placeholder: unit tests live here in the implementation repository.
+# CI expects: pytest tests/unit/ -v --tb=short --cov=src --cov-report=xml

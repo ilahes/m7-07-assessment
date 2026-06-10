@@ -1,0 +1,40 @@
+{
+  "request_id": "550e8400-e29b-41d4-a716-446655440000",
+  "user_id": "u_12345",
+  "recommendations": [
+    {
+      "item_id": "item_9876543",
+      "score": 0.8423,
+      "rank": 1,
+      "title": "Running Shoes - Air Max Pro",
+      "category": "footwear/running",
+      "price_usd": 129.99,
+      "in_stock": true,
+      "image_url": "https://cdn.retailco.com/products/9876543/main.jpg"
+    },
+    {
+      "item_id": "item_9876544",
+      "score": 0.8201,
+      "rank": 2,
+      "title": "Compression Running Socks 3-Pack",
+      "category": "accessories/socks",
+      "price_usd": 18.99,
+      "in_stock": true,
+      "image_url": "https://cdn.retailco.com/products/9876544/main.jpg"
+    },
+    {
+      "item_id": "item_9876545",
+      "score": 0.7988,
+      "rank": 3,
+      "title": "Performance Running Shorts",
+      "category": "apparel/shorts",
+      "price_usd": 49.99,
+      "in_stock": true,
+      "image_url": "https://cdn.retailco.com/products/9876545/main.jpg"
+    }
+  ],
+  "model_version": "v1.3.0-20260601",
+  "experiment_id": "exp-20260601-challenger:treatment",
+  "fallback_used": false,
+  "latency_ms": 47
+}
